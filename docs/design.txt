@@ -1,1 +1,236 @@
+FUNCTION ParseFixMessage(messageText, delimiter)
+    // Really need to handle different delimiters well. Some logs use SOH, some use pipe
+    // Also need to handle incomplete messages that might appear in logs
+    
+    Split messageText by delimiter into fields
+    Create empty dictionary parsedMessage
+    
+    FOR EACH field IN fields
+        IF field contains "="
+            Split field into tag and value at first "="
+            Store value in parsedMessage with tag as key
+        END IF
+    END FOR
+    
+    RETURN parsedMessage
+END FUNCTION
+
+
+
+FUNCTION AnalyzeMessage(parsedMessage)
+    // The challenge with FIX is all the different message types
+    // We need to focus on the ones traders care about - especially rejects!
+    
+    Initialize result structure with:
+        - messageType = NULL
+        - isError = FALSE
+        - errorReason = NULL
+        - keyFields = empty dictionary
+    
+    IF parsedMessage has tag "35" THEN
+        msgType = value of tag "35"
+        Set result.messageType = msgType
+        
+        // Check for common error message types
+        IF msgType is "3" THEN // Session reject
+            Set result.isError = TRUE
+            Set result.errorReason = "Session Reject"
+            
+            IF parsedMessage has tag "58" THEN // Text field
+                Set result.errorReason = value of tag "58"
+            END IF
+            
+        ELSE IF msgType is "8" AND parsedMessage has tag "39" with value "8" THEN
+            // Execution report with reject status
+            Set result.isError = TRUE
+            Set result.errorReason = "Order Rejected"
+            
+        ELSE IF msgType is "j" THEN // Business message reject
+            Set result.isError = TRUE
+            Set result.errorReason = "Business Reject"
+        END IF
+    END IF
+    
+    // Extract key fields traders usually care about
+    // Would be good to make this configurable eventually
+    FOR EACH tag IN ["11", "37", "17", "55", "54", "38", "44", "59", "60"]
+        IF parsedMessage has tag THEN
+            Add to result.keyFields with tag as key and value from parsedMessage
+        END IF
+    END FOR
+    
+    RETURN result
+END FUNCTION
+
+FUNCTION ProcessLogFile(filePath)
+    // Every firm has different log formats. Need to be flexible here.
+    // Some have timestamps, some don't. Some have other stuff mixed in.
+    
+    Create empty list results
+    
+    Open filePath for reading
+    FOR EACH line IN file
+        IF line contains "8=FIX" THEN // Indicator of FIX message
+            fixMessage = ExtractFixMessage(line) // Helper function to extract just the FIX part
+            
+            IF fixMessage is not NULL THEN
+                parsed = ParseFixMessage(fixMessage)
+                analysis = AnalyzeMessage(parsed)
+                
+                Create record with:
+                    - timestamp from log line if available
+                    - raw message
+                    - parsed message
+                    - analysis results
+                
+                Add record to results
+            END IF
+        END IF
+    END FOR
+    
+    RETURN results
+END FUNCTION
+
+
+
+CLASS FixMonitor
+    // This is where it gets complex. Need to watch files as they change.
+    // Log rotation is a huge pain point here - when files roll over.
+    
+    CONSTRUCTOR(logDirectory)
+        Set this.logDirectory = logDirectory
+        Initialize empty dictionary this.watches
+        Initialize callback collections for different event types
+    END CONSTRUCTOR
+    
+    FUNCTION Start()
+        // Should probably run in background thread
+        // Would be good to make check interval configurable
+        
+        Find all log files in logDirectory
+        FOR EACH logFile in found files
+            Call WatchFile(logFile)
+        END FOR
+        
+        WHILE monitoring is active
+            Call CheckForUpdates()
+            Sleep for short interval
+        END WHILE
+    END FUNCTION
+    
+    FUNCTION WatchFile(filePath)
+        // Need to track where we are in each file
+        Get current size of file
+        Store in watches with last position = current size
+    END FUNCTION
+    
+    FUNCTION CheckForUpdates()
+        FOR EACH filePath, watchInfo IN watches
+            Get current size of filePath
+            
+            IF current size > watchInfo.lastPosition THEN
+                // File has grown - read new content
+                content = Read filePath from lastPosition to end
+                
+                FOR EACH line IN content
+                    IF line contains FIX message THEN
+                        fixMessage = ExtractFixMessage(line)
+                        IF fixMessage is not NULL THEN
+                            Call ProcessMessage(fixMessage, filePath)
+                        END IF
+                    END IF
+                END FOR
+                
+                Update watchInfo.lastPosition to current size
+                
+            ELSE IF current size < watchInfo.lastPosition THEN
+                // File was probably rotated/truncated
+                Reset watchInfo.lastPosition to 0
+            END IF
+        END FOR
+    END FUNCTION
+    
+    FUNCTION ProcessMessage(message, sourceFile)
+        parsed = ParseFixMessage(message)
+        analysis = AnalyzeMessage(parsed)
+        
+        // Trigger appropriate callbacks
+        FOR EACH callback IN onMessageCallbacks
+            Call callback with (parsed, analysis, sourceFile)
+        END FOR
+        
+        IF analysis.isError THEN
+            FOR EACH callback IN onErrorCallbacks
+                Call callback with (parsed, analysis, sourceFile)
+            END FOR
+            
+            IF analysis.errorReason contains "reject" THEN
+                FOR EACH callback IN onRejectCallbacks
+                    Call callback with (parsed, analysis, sourceFile)
+                END FOR
+            END IF
+        END IF
+    END FUNCTION
+    
+    FUNCTION OnMessage(callback)
+        Add callback to onMessageCallbacks
+    END FUNCTION
+    
+    FUNCTION OnError(callback)
+        Add callback to onErrorCallbacks
+    END FUNCTION
+    
+    FUNCTION OnReject(callback)
+        Add callback to onRejectCallbacks
+    END FUNCTION
+END CLASS
+
+
+
+FUNCTION ExtractFixMessage(logLine)
+    // This is tricky and will need to be adaptable to different log formats
+    // Might need to offer configuration options here
+    
+    Look for content starting with "8=FIX" and containing field delimiters
+    IF matching content found THEN
+        RETURN the matched content
+    ELSE
+        RETURN NULL
+    END IF
+END FUNCTION
+
+FUNCTION ExtractTimestamp(logLine)
+    // Again, formats vary widely between systems
+    
+    Look for timestamp pattern in logLine
+    IF found THEN
+        RETURN matched timestamp
+    ELSE
+        RETURN "Unknown"
+    END IF
+END FUNCTION
+
+
+
+
+// For batch processing:
+results = ProcessLogFile("/path/to/fix.log")
+FOR EACH record IN results
+    IF record.analysis.isError THEN
+        Print "REJECT at " + record.timestamp + ": " + record.analysis.errorReason
+        Print "Order ID: " + record.analysis.keyFields["11"] if present
+    END IF
+END FOR
+
+// For real-time monitoring:
+monitor = new FixMonitor("/path/to/logs")
+monitor.OnReject(FUNCTION(msg, analysis, source)
+    Print "REJECT in " + source + ": " + analysis.errorReason
+END FUNCTION)
+monitor.Start()
+
+
+
+
+
 
